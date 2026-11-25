@@ -75,7 +75,7 @@ export function signPayosWebhookData(data: WebhookData, checksumKey: string): st
 /**
  * Verifies a PayOS webhook payload signature in constant time.
  */
-export function verifyPayosWebhookSignature(webhookBody: Webhook, checksumKey: string): WebhookData {
+function verifyPayosWebhookSignature(webhookBody: Webhook, checksumKey: string): WebhookData {
   const expectedSignature = signPayosWebhookData(webhookBody.data, checksumKey);
   const actualBuffer = Buffer.from(webhookBody.signature, 'utf8');
   const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
