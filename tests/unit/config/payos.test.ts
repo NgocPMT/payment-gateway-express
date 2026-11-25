@@ -2,10 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Webhook, WebhookData } from '@payos/node';
 
 import {
+  createPayosClient,
   MockPayosClient,
+  RealPayosClient,
   signPayosWebhookData,
   type MockRedisClient,
 } from '../../../src/config/payos.js';
+import { env } from '../../../src/config/env.js';
 import { TIME_SECONDS } from '../../../src/shared/constants/time.js';
 
 const TEST_CHECKSUM_KEY = 'test-checksum-key-at-least-16-chars';
@@ -175,5 +178,134 @@ describe('MockPayosClient', () => {
       signature: '0'.repeat(signature.length),
     };
     await expect(client.verifyPaymentWebhookData(invalidSignature)).rejects.toThrow('Invalid PayOS webhook signature');
+  });
+
+  it('throws when orderCode is not found in Redis for getPaymentLinkInformation or cancelPaymentLink', async () => {
+    const { redis } = createInMemoryRedisStub();
+    const client = new MockPayosClient({
+      checksumKey: TEST_CHECKSUM_KEY,
+      getRedisClient: async () => redis,
+    });
+
+    await expect(client.getPaymentLinkInformation(SAMPLE_ORDER_CODE)).rejects.toThrow(
+      `Mock PayOS payment link not found for orderCode ${SAMPLE_ORDER_CODE}`,
+    );
+    await expect(client.cancelPaymentLink(SAMPLE_ORDER_CODE)).rejects.toThrow(
+      `Mock PayOS payment link not found for orderCode ${SAMPLE_ORDER_CODE}`,
+    );
+  });
+
+  it('keeps non-expired PENDING payment link as PENDING on getPaymentLinkInformation', async () => {
+    const { redis } = createInMemoryRedisStub();
+    const client = new MockPayosClient({
+      checksumKey: TEST_CHECKSUM_KEY,
+      getRedisClient: async () => redis,
+    });
+
+    const expiredAt = Math.floor(Date.now() / MS_PER_SECOND) + FUTURE_OFFSET_SECONDS;
+    await client.createPaymentLink({
+      orderCode: SAMPLE_ORDER_CODE,
+      amount: SAMPLE_AMOUNT,
+      description: 'Active order',
+      returnUrl: 'http://localhost:3000/return',
+      cancelUrl: 'http://localhost:3000/cancel',
+      expiredAt,
+    });
+
+    const info = await client.getPaymentLinkInformation(SAMPLE_ORDER_CODE);
+    expect(info.status).toBe('PENDING');
+  });
+
+  it('does not overwrite status or metadata when cancelling a non-PENDING payment link', async () => {
+    const { redis } = createInMemoryRedisStub();
+    const client = new MockPayosClient({
+      checksumKey: TEST_CHECKSUM_KEY,
+      getRedisClient: async () => redis,
+    });
+
+    await client.createPaymentLink({
+      orderCode: SAMPLE_ORDER_CODE,
+      amount: SAMPLE_AMOUNT,
+      description: 'Already cancelled',
+      returnUrl: 'http://localhost:3000/return',
+      cancelUrl: 'http://localhost:3000/cancel',
+    });
+
+    const firstCancel = await client.cancelPaymentLink(SAMPLE_ORDER_CODE, 'First reason');
+    const secondCancel = await client.cancelPaymentLink(SAMPLE_ORDER_CODE, 'Second reason');
+    expect(secondCancel.status).toBe('CANCELLED');
+    expect(secondCancel.cancellationReason).toBe('First reason');
+    expect(secondCancel.canceledAt).toBe(firstCancel.canceledAt);
+
+    const expiredOrderCode = SAMPLE_ORDER_CODE + 1;
+    await client.createPaymentLink({
+      orderCode: expiredOrderCode,
+      amount: SAMPLE_AMOUNT,
+      description: 'Already expired',
+      returnUrl: 'http://localhost:3000/return',
+      cancelUrl: 'http://localhost:3000/cancel',
+      expiredAt: PAST_EXPIRED_AT,
+    });
+    await client.getPaymentLinkInformation(expiredOrderCode);
+
+    const cancelExpired = await client.cancelPaymentLink(expiredOrderCode, 'Too late');
+    expect(cancelExpired.status).toBe('EXPIRED');
+    expect(cancelExpired.cancellationReason).toBeNull();
+    expect(cancelExpired.canceledAt).toBeNull();
+  });
+
+  it('rejects webhook signatures with mismatched length without throwing RangeError', async () => {
+    const { redis } = createInMemoryRedisStub();
+    const client = new MockPayosClient({
+      checksumKey: TEST_CHECKSUM_KEY,
+      getRedisClient: async () => redis,
+    });
+
+    const data = buildWebhookData();
+    const baseWebhook: Webhook = {
+      code: '00',
+      desc: 'success',
+      success: true,
+      data,
+      signature: '',
+    };
+
+    await expect(client.verifyPaymentWebhookData(baseWebhook)).rejects.toThrow('Invalid PayOS webhook signature');
+    await expect(
+      client.verifyPaymentWebhookData({
+        ...baseWebhook,
+        signature: 'short-sig',
+      }),
+    ).rejects.toThrow('Invalid PayOS webhook signature');
+  });
+});
+
+describe('createPayosClient', () => {
+  it('returns MockPayosClient in mock mode, RealPayosClient in real mode, and throws when credentials are missing', () => {
+    const originalEnv = {
+      PAYOS_MOCK_MODE: env.PAYOS_MOCK_MODE,
+      PAYOS_CLIENT_ID: env.PAYOS_CLIENT_ID,
+      PAYOS_API_KEY: env.PAYOS_API_KEY,
+    };
+
+    try {
+      env.PAYOS_MOCK_MODE = true;
+      expect(createPayosClient()).toBeInstanceOf(MockPayosClient);
+
+      env.PAYOS_MOCK_MODE = false;
+      env.PAYOS_CLIENT_ID = undefined;
+      env.PAYOS_API_KEY = undefined;
+      expect(() => createPayosClient()).toThrow(
+        'PAYOS_CLIENT_ID and PAYOS_API_KEY are required when PAYOS_MOCK_MODE is false',
+      );
+
+      env.PAYOS_CLIENT_ID = 'test-client-id';
+      env.PAYOS_API_KEY = 'test-api-key';
+      expect(createPayosClient()).toBeInstanceOf(RealPayosClient);
+    } finally {
+      env.PAYOS_MOCK_MODE = originalEnv.PAYOS_MOCK_MODE;
+      env.PAYOS_CLIENT_ID = originalEnv.PAYOS_CLIENT_ID;
+      env.PAYOS_API_KEY = originalEnv.PAYOS_API_KEY;
+    }
   });
 });
