@@ -59,6 +59,19 @@ export async function getRedis(): Promise<RedisClient | undefined> {
   return redisUnavailable ? undefined : redis;
 }
 
+export async function requireRedis(): Promise<RedisClient> {
+  if (!redis) {
+    throw new Error('REDIS_URL is required for strict Redis operations');
+  }
+
+  const client = await getRedis();
+  if (!client) {
+    throw new Error('Redis is unavailable; cannot proceed without Redis');
+  }
+
+  return client;
+}
+
 export async function disconnectRedis(): Promise<void> {
   if (redis?.isOpen) {
     await redis.quit();
