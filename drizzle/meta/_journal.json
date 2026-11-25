@@ -8,6 +8,20 @@
       "when": 1791902219635,
       "tag": "0000_lush_bishop",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795589158125,
+      "tag": "0001_flawless_nitro",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795602231397,
+      "tag": "0002_useful_carmella_unuscione",
+      "breakpoints": true
     }
   ]
 }

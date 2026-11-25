@@ -1,4 +1,5 @@
-import { pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { check, pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { v7 as uuidv7 } from 'uuid';
 import { users } from './user.model.js';
 
@@ -24,6 +25,13 @@ export const accounts = pgTable(
       .$onUpdate(() => new Date()),
   },
   (table) => [
+    check(
+      'accounts_provider_valid_chk',
+      sql`${table.provider} IN (${sql.join(
+        authProviders.map((provider) => sql.raw(`'${provider}'`)),
+        sql`, `,
+      )})`,
+    ),
     uniqueIndex('accounts_provider_provider_account_id_idx').on(table.provider, table.providerAccountId),
     uniqueIndex('accounts_user_id_provider_idx').on(table.userId, table.provider),
   ],
