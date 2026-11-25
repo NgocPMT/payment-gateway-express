@@ -20,8 +20,18 @@ services:
   redis:
     image: redis:7.4.9-alpine3.21
     container_name: express-template-redis
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
 
 volumes:
   postgres_data:
+  redis_data:
