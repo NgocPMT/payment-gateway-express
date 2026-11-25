@@ -28,7 +28,7 @@ const envSchema = z
     REGISTER_RATE_LIMIT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(DEFAULT_REGISTER_RATE_LIMIT_MAX_ATTEMPTS),
     PAYOS_MOCK_MODE: z
       .enum(['true', 'false'])
-      .default('false')
+      .default('true')
       .transform((value) => value === 'true'),
     PAYOS_CLIENT_ID: z.string().optional(),
     PAYOS_API_KEY: z.string().optional(),
