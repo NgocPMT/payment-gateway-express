@@ -2,11 +2,15 @@ import 'dotenv/config';
 import { createServer } from 'node:http';
 
 import { connectDatabase, disconnectDatabase } from './config/db.js';
-import { disconnectRedis } from './config/redis.js';
+import { disconnectRedis, requireRedis } from './config/redis.js';
 import { env } from './config/env.js';
 
 async function bootstrap(): Promise<void> {
   await connectDatabase();
+
+  if (env.PAYOS_MOCK_MODE) {
+    await requireRedis();
+  }
 
   const { app } = await import('./app.js');
 
