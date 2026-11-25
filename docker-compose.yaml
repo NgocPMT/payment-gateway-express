@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: express-template-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: express_template
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d express_template"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+
+  redis:
+    image: redis:7.4.9-alpine3.21
+    container_name: express-template-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
