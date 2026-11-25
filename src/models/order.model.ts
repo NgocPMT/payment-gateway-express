@@ -30,6 +30,13 @@ export const orders = pgTable(
   },
   (table) => [
     check('orders_amount_positive_chk', sql`${table.amount} > 0`),
+    check(
+      'orders_status_valid_chk',
+      sql`${table.status} IN (${sql.join(
+        orderStatuses.map((status) => sql.raw(`'${status}'`)),
+        sql`, `,
+      )})`,
+    ),
     index('orders_user_id_created_at_idx').on(table.userId, table.createdAt),
     index('orders_status_idx').on(table.status),
   ],
