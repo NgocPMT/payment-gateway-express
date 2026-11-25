@@ -1,4 +1,5 @@
-import { integer, jsonb, pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { check, integer, jsonb, pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { v7 as uuidv7 } from 'uuid';
 
 import { users } from './user.model.js';
@@ -33,7 +34,16 @@ export const idempotencyKeys = pgTable(
       .defaultNow()
       .$onUpdate(() => new Date()),
   },
-  (table) => [uniqueIndex('idempotency_keys_user_endpoint_key_idx').on(table.userId, table.endpoint, table.key)],
+  (table) => [
+    check(
+      'idempotency_keys_status_valid_chk',
+      sql`${table.status} IN (${sql.join(
+        idempotencyStatuses.map((status) => sql.raw(`'${status}'`)),
+        sql`, `,
+      )})`,
+    ),
+    uniqueIndex('idempotency_keys_user_endpoint_key_idx').on(table.userId, table.endpoint, table.key),
+  ],
 );
 
 export type IdempotencyKeyRecord = typeof idempotencyKeys.$inferSelect;
