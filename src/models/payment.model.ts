@@ -37,6 +37,13 @@ export const payments = pgTable(
   (table) => [
     check('payments_amount_positive_chk', sql`${table.amount} > 0`),
     check('payments_order_code_positive_chk', sql`${table.orderCode} > 0`),
+    check(
+      'payments_status_valid_chk',
+      sql`${table.status} IN (${sql.join(
+        paymentStatuses.map((status) => sql.raw(`'${status}'`)),
+        sql`, `,
+      )})`,
+    ),
     uniqueIndex('payments_one_pending_per_order_idx')
       .on(table.orderId)
       .where(sql`${table.status} = 'PENDING'`),
