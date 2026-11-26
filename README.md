@@ -1,6 +1,6 @@
-# Express PostgreSQL Template
+# Payment Gateway Express
 
-A clean, modular, and production-ready Express 5 + TypeScript template featuring PostgreSQL (Drizzle ORM), Redis, time-ordered UUIDv7 identifiers, stateless JWT authentication, OpenAPI/Swagger UI integration, Vitest, and strict adherence to a 6-layer vertical-slice architecture.
+A clean, modular, and production-ready Express 5 + TypeScript payment gateway backend integrating **PayOS**, PostgreSQL 17 (Drizzle ORM), Redis, time-ordered UUIDv7 identifiers, stateless JWT authentication, OpenAPI/Swagger UI integration, Vitest, and strict adherence to a 6-layer vertical-slice architecture.
 
 ---
 
@@ -8,6 +8,7 @@ A clean, modular, and production-ready Express 5 + TypeScript template featuring
 
 - **Runtime & Language**: Node.js (ESM), TypeScript (strict mode), [tsx](https://github.com/privatenumber/tsx)
 - **Web Framework**: Express 5
+- **Payment Integration**: [PayOS](https://payos.vn/) (`@payos/node`) with local mock mode support
 - **Database & ORM**: PostgreSQL 17 with [Drizzle ORM](https://orm.drizzle.team/) and UUIDv7 primary keys
 - **Cache & Rate Limiting**: Redis with `redis` and `express-rate-limit`
 - **Authentication**: Stateless JWT (`jsonwebtoken` + `bcryptjs`) with access & refresh tokens
@@ -15,6 +16,26 @@ A clean, modular, and production-ready Express 5 + TypeScript template featuring
 - **Testing**: [Vitest](https://vitest.dev/) (unit & integration tests)
 - **Code Quality**: ESLint (v9/v10 flat config) with `@typescript-eslint`
 - **CI/CD**: GitHub Actions
+
+---
+
+## Project Structure & Domain Modules
+
+### Feature Modules (`src/modules/`)
+
+- `auth`: Account registration, login, token refresh, and logout flows.
+- `users`: User profile management and role/state retrieval.
+- `orders`: Order domain logic, validation schemas, and repository.
+- `health`: Service health check endpoint.
+
+### Database Models (`src/models/`)
+
+- `accounts` (`account.model.ts`)
+- `users` (`user.model.ts`)
+- `orders` (`order.model.ts`)
+- `payments` (`payment.model.ts`)
+- `idempotency_keys` (`idempotency-key.model.ts`)
+- `webhook_events` (`webhook-event.model.ts`)
 
 ---
 
@@ -50,9 +71,14 @@ Copy the example environment file:
 cp .env.example .env
 ```
 
+Key environment variables in `.env.example`:
+- `DATABASE_URL`: PostgreSQL connection string (defaults to `postgresql://postgres:postgres@127.0.0.1:5432/payment_gateway`).
+- `REDIS_URL`: Redis connection string (`redis://127.0.0.1:6379`).
+- `PAYOS_MOCK_MODE`: Set to `true` for local development without live PayOS credentials; set `PAYOS_CLIENT_ID`, `PAYOS_API_KEY`, `PAYOS_CHECKSUM_KEY`, `PAYOS_RETURN_URL`, and `PAYOS_CANCEL_URL` for live/sandbox PayOS integration.
+
 ### 3. Start PostgreSQL & Redis
 
-Launch PostgreSQL and Redis via Docker Compose:
+Launch PostgreSQL (`payment-gateway-postgres`, database `payment_gateway`) and Redis (`payment-gateway-redis`) via Docker Compose:
 
 ```bash
 docker compose up -d
