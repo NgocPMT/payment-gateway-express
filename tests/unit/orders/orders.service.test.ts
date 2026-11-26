@@ -38,80 +38,60 @@ describe('OrdersService', () => {
 
   describe('createOrder', () => {
     it('creates an order and returns mapped DTO', async () => {
-      const created = buildOrderRecord();
+      const input = { amount: 50000, description: 'Order #1001' };
+      const created = buildOrderRecord(input);
       mockRepo.createOrder = vi.fn().mockResolvedValue(created);
 
-      const result = await ordersService.createOrder(USER_ID, {
-        amount: 50000,
-        description: 'Order #1001',
-      });
+      const result = await ordersService.createOrder(USER_ID, input);
 
       expect(mockRepo.createOrder).toHaveBeenCalledWith({
         userId: USER_ID,
-        amount: 50000,
-        description: 'Order #1001',
+        ...input,
       });
       expect(result).toEqual({
-        id: ORDER_ID,
-        userId: USER_ID,
-        amount: 50000,
-        description: 'Order #1001',
-        status: 'PENDING',
-        createdAt: '2026-11-26T00:00:00.000Z',
-        updatedAt: '2026-11-26T00:00:00.000Z',
+        ...created,
+        createdAt: created.createdAt.toISOString(),
+        updatedAt: created.updatedAt.toISOString(),
       });
     });
   });
 
   describe('listOrders', () => {
     it('returns paginated orders without status filter', async () => {
+      const query = { page: 2, limit: 10 };
       const order = buildOrderRecord();
       mockRepo.findManyByUserId = vi.fn().mockResolvedValue({
         items: [order],
         total: 25,
       });
 
-      const result = await ordersService.listOrders(USER_ID, {
-        page: 2,
-        limit: 10,
-      });
+      const result = await ordersService.listOrders(USER_ID, query);
 
-      expect(mockRepo.findManyByUserId).toHaveBeenCalledWith(USER_ID, {
-        page: 2,
-        limit: 10,
-      });
+      expect(mockRepo.findManyByUserId).toHaveBeenCalledWith(USER_ID, query);
       expect(result.items).toHaveLength(1);
       expect(result.items[0]?.id).toBe(ORDER_ID);
       expect(result.pagination).toEqual({
-        page: 2,
-        limit: 10,
+        ...query,
         total: 25,
         totalPages: 3,
       });
     });
 
     it('forwards status filter and returns totalPages 0 when empty', async () => {
+      const query = { page: 1, limit: 20, status: 'PAID' as const };
       mockRepo.findManyByUserId = vi.fn().mockResolvedValue({
         items: [],
         total: 0,
       });
 
-      const result = await ordersService.listOrders(USER_ID, {
-        page: 1,
-        limit: 20,
-        status: 'PAID',
-      });
+      const result = await ordersService.listOrders(USER_ID, query);
 
-      expect(mockRepo.findManyByUserId).toHaveBeenCalledWith(USER_ID, {
-        page: 1,
-        limit: 20,
-        status: 'PAID',
-      });
+      expect(mockRepo.findManyByUserId).toHaveBeenCalledWith(USER_ID, query);
       expect(result).toEqual({
         items: [],
         pagination: {
-          page: 1,
-          limit: 20,
+          page: query.page,
+          limit: query.limit,
           total: 0,
           totalPages: 0,
         },
