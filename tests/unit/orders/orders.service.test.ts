@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { OrderRecord } from '../../../src/models/order.model.js';
-import type { OrdersRepository } from '../../../src/modules/orders/orders.repository.js';
+import type { OrderDbExecutor, OrdersRepository } from '../../../src/modules/orders/orders.repository.js';
 import { OrdersService } from '../../../src/modules/orders/orders.service.js';
 import { HTTP_STATUS } from '../../../src/shared/constants/http-status.js';
 import { isHttpError } from '../../../src/shared/errors/http-error.js';
@@ -31,7 +31,10 @@ describe('OrdersService', () => {
       createOrder: vi.fn(),
       findById: vi.fn(),
       findByIdAndUserId: vi.fn(),
+      findByIdForUpdate: vi.fn(),
+      findByIdAndUserIdForUpdate: vi.fn(),
       findManyByUserId: vi.fn(),
+      markPaidIfPending: vi.fn(),
     };
     ordersService = new OrdersService(mockRepo as OrdersRepository);
   });
@@ -131,6 +134,78 @@ describe('OrdersService', () => {
       const result = await ordersService.getOwnedOrderEntity(USER_ID, ORDER_ID);
 
       expect(result).toBe(order);
+    });
+  });
+
+  describe('lockOrderById', () => {
+    it('returns locked order when found', async () => {
+      const fakeTx = {} as OrderDbExecutor;
+      const order = buildOrderRecord();
+      mockRepo.findByIdForUpdate = vi.fn().mockResolvedValue(order);
+
+      const result = await ordersService.lockOrderById(ORDER_ID, fakeTx);
+
+      expect(mockRepo.findByIdForUpdate).toHaveBeenCalledWith(ORDER_ID, fakeTx);
+      expect(result).toBe(order);
+    });
+
+    it('throws 404 HttpError when order does not exist', async () => {
+      const fakeTx = {} as OrderDbExecutor;
+      mockRepo.findByIdForUpdate = vi.fn().mockResolvedValue(null);
+
+      await expect(ordersService.lockOrderById(ORDER_ID, fakeTx)).rejects.toSatisfy(
+        (error: unknown) =>
+          isHttpError(error) &&
+          error.statusCode === HTTP_STATUS.HTTP_404_NOT_FOUND &&
+          error.message === 'Order not found',
+      );
+    });
+  });
+
+  describe('lockOwnedOrder', () => {
+    it('returns locked order when owned by user', async () => {
+      const fakeTx = {} as OrderDbExecutor;
+      const order = buildOrderRecord();
+      mockRepo.findByIdAndUserIdForUpdate = vi.fn().mockResolvedValue(order);
+
+      const result = await ordersService.lockOwnedOrder(USER_ID, ORDER_ID, fakeTx);
+
+      expect(mockRepo.findByIdAndUserIdForUpdate).toHaveBeenCalledWith(ORDER_ID, USER_ID, fakeTx);
+      expect(result).toBe(order);
+    });
+
+    it('throws 404 HttpError when order is missing or not owned by user', async () => {
+      const fakeTx = {} as OrderDbExecutor;
+      mockRepo.findByIdAndUserIdForUpdate = vi.fn().mockResolvedValue(null);
+
+      await expect(ordersService.lockOwnedOrder(USER_ID, ORDER_ID, fakeTx)).rejects.toSatisfy(
+        (error: unknown) =>
+          isHttpError(error) &&
+          error.statusCode === HTTP_STATUS.HTTP_404_NOT_FOUND &&
+          error.message === 'Order not found',
+      );
+    });
+  });
+
+  describe('markOrderPaidIfPending', () => {
+    it('returns updated order when order was PENDING', async () => {
+      const fakeTx = {} as OrderDbExecutor;
+      const paidOrder = buildOrderRecord({ status: 'PAID' });
+      mockRepo.markPaidIfPending = vi.fn().mockResolvedValue(paidOrder);
+
+      const result = await ordersService.markOrderPaidIfPending(ORDER_ID, fakeTx);
+
+      expect(mockRepo.markPaidIfPending).toHaveBeenCalledWith(ORDER_ID, fakeTx);
+      expect(result).toBe(paidOrder);
+    });
+
+    it('returns null when order was already transitioned', async () => {
+      const fakeTx = {} as OrderDbExecutor;
+      mockRepo.markPaidIfPending = vi.fn().mockResolvedValue(null);
+
+      const result = await ordersService.markOrderPaidIfPending(ORDER_ID, fakeTx);
+
+      expect(result).toBeNull();
     });
   });
 });

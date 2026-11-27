@@ -184,6 +184,28 @@ function extractIdempotencyKey(req: Request): string {
   return trimmed;
 }
 
+function toResponseBody<T>(result: T): Record<string, unknown> {
+  return result !== null && typeof result === 'object' && !Array.isArray(result)
+    ? (result as Record<string, unknown>)
+    : { data: result };
+}
+
+async function runBestEffortCompensate<TPrepared>(
+  compensate: ((prepared: TPrepared, error: unknown) => Promise<void>) | undefined,
+  prepared: TPrepared,
+  error: unknown,
+): Promise<void> {
+  if (!compensate) {
+    return;
+  }
+
+  try {
+    await compensate(prepared, error);
+  } catch {
+    // Best-effort compensation must not mask the original persistence error.
+  }
+}
+
 /**
  * Runs an idempotent mutation and marks the idempotency record COMPLETED inside
  * the same database transaction, ensuring both commit atomically before the HTTP
@@ -202,16 +224,70 @@ export async function executeIdempotent<T>(
   try {
     return await ctx.store.runInTransaction(async (tx) => {
       const result = await operation(tx);
-      const responseBody =
-        result !== null && typeof result === 'object' && !Array.isArray(result)
-          ? (result as Record<string, unknown>)
-          : { data: result };
-
       const completedExpiresAt = new Date(Date.now() + ctx.completedTtlMs);
-      await ctx.store.markCompleted(ctx.recordId, statusCode, responseBody, completedExpiresAt, tx);
+      await ctx.store.markCompleted(
+        ctx.recordId,
+        statusCode,
+        toResponseBody(result),
+        completedExpiresAt,
+        tx,
+      );
       return result;
     });
   } catch (error) {
+    await ctx.store.deleteById(ctx.recordId);
+    throw error;
+  }
+}
+
+/**
+ * Runs a two-phase idempotent mutation for endpoints that call an external API
+ * (such as PayOS). Phase 1 (`prepare`) executes outside any database transaction,
+ * and Phase 2 (`commitInTx`) persists the result and marks the idempotency record
+ * COMPLETED atomically in one transaction. Cleans up IN_PROGRESS and invokes
+ * optional best-effort `compensate` if Phase 2 fails.
+ */
+export async function executeExternalIdempotent<TPrepared, TResult>(
+  res: Response,
+  statusCode: number,
+  prepare: () => Promise<TPrepared>,
+  commitInTx: (prepared: TPrepared, tx?: DbExecutor) => Promise<TResult>,
+  compensate?: (prepared: TPrepared, error: unknown) => Promise<void>,
+): Promise<TResult> {
+  const ctx = res.locals.idempotency;
+  if (!ctx) {
+    const prepared = await prepare();
+    try {
+      return await commitInTx(prepared);
+    } catch (error) {
+      await runBestEffortCompensate(compensate, prepared, error);
+      throw error;
+    }
+  }
+
+  let prepared: TPrepared;
+  try {
+    prepared = await prepare();
+  } catch (error) {
+    await ctx.store.deleteById(ctx.recordId);
+    throw error;
+  }
+
+  try {
+    return await ctx.store.runInTransaction(async (tx) => {
+      const result = await commitInTx(prepared, tx);
+      const completedExpiresAt = new Date(Date.now() + ctx.completedTtlMs);
+      await ctx.store.markCompleted(
+        ctx.recordId,
+        statusCode,
+        toResponseBody(result),
+        completedExpiresAt,
+        tx,
+      );
+      return result;
+    });
+  } catch (error) {
+    await runBestEffortCompensate(compensate, prepared, error);
     await ctx.store.deleteById(ctx.recordId);
     throw error;
   }
