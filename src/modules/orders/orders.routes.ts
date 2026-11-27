@@ -1,6 +1,7 @@
 import { Router } from 'express';
 
 import { authenticate } from '../../middleware/auth.middleware.js';
+import { requireIdempotencyKey } from '../../middleware/idempotency.middleware.js';
 import {
   validateBody,
   validateParams,
@@ -17,6 +18,11 @@ export const ordersRouter = Router();
 
 ordersRouter.use(authenticate);
 
-ordersRouter.post('/', validateBody(createOrderSchema), ordersController.createOrder);
+ordersRouter.post(
+  '/',
+  validateBody(createOrderSchema),
+  requireIdempotencyKey('POST /api/v1/orders'),
+  ordersController.createOrder,
+);
 ordersRouter.get('/', validateQuery(listOrdersQuerySchema), ordersController.listOrders);
 ordersRouter.get('/:id', validateParams(orderIdParamSchema), ordersController.getOrderById);

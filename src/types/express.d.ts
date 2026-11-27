@@ -1,3 +1,4 @@
+import type { IdempotencyExecutionContext } from '../middleware/idempotency.middleware.js';
 import type { ValidatedRequestData } from '../middleware/validate.js';
 import type { UserDoc } from '../models/user.model.js';
 
@@ -15,6 +16,7 @@ declare module 'express-serve-static-core' {
   interface Locals {
     validated?: ValidatedRequestData;
     user?: UserDoc | null;
+    idempotency?: IdempotencyExecutionContext;
   }
 }
 
