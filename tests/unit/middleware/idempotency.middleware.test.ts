@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IdempotencyKeyRecord } from '../../../src/models/idempotency-key.model.js';
 import {
   computeRequestHash,
+  executeExternalIdempotent,
   executeIdempotent,
   requireIdempotencyKey,
   type DbExecutor,
@@ -447,6 +448,193 @@ describe('idempotency.middleware', () => {
       expect(store.findByKey).not.toHaveBeenCalled();
       expect(store.tryAcquire).toHaveBeenCalledTimes(1);
       expect(next).toHaveBeenCalledWith();
+    });
+  });
+
+  describe('executeExternalIdempotent', () => {
+    it('runs prepare outside transaction and commits result + markCompleted inside transaction', async () => {
+      let txEntered = false;
+      store.runInTransaction = vi.fn(async (fn) => {
+        txEntered = true;
+        return fn(fakeTx);
+      });
+      const callOrder: string[] = [];
+
+      const res = createMockResponse({ orderId: 'order-1' });
+      (res.locals as Record<string, unknown>).idempotency = {
+        recordId: 'rec-ext-1',
+        store,
+        completedTtlMs: 86_400_000,
+      };
+
+      const prepare = vi.fn(async () => {
+        callOrder.push('prepare');
+        expect(txEntered).toBe(false);
+        return { orderCode: 12345 };
+      });
+      const commitInTx = vi.fn(async (prepared: { orderCode: number }, tx?: DbExecutor) => {
+        callOrder.push('commitInTx');
+        expect(tx).toBe(fakeTx);
+        return { id: 'pay-1', orderCode: prepared.orderCode };
+      });
+      const compensate = vi.fn(async () => undefined);
+
+      const result = await executeExternalIdempotent(
+        res as never,
+        HTTP_STATUS.HTTP_201_CREATED,
+        prepare,
+        commitInTx,
+        compensate,
+      );
+
+      expect(result).toEqual({ id: 'pay-1', orderCode: 12345 });
+      expect(callOrder).toEqual(['prepare', 'commitInTx']);
+      expect(store.markCompleted).toHaveBeenCalledWith(
+        'rec-ext-1',
+        HTTP_STATUS.HTTP_201_CREATED,
+        { id: 'pay-1', orderCode: 12345 },
+        expect.any(Date),
+        fakeTx,
+      );
+      expect(compensate).not.toHaveBeenCalled();
+      expect(store.deleteById).not.toHaveBeenCalled();
+    });
+
+    it('deletes IN_PROGRESS record without starting transaction or compensating when prepare fails', async () => {
+      const res = createMockResponse({ orderId: 'order-1' });
+      (res.locals as Record<string, unknown>).idempotency = {
+        recordId: 'rec-ext-2',
+        store,
+        completedTtlMs: 86_400_000,
+      };
+
+      const prepareError = new Error('PayOS upstream failure');
+      const prepare = vi.fn(async () => {
+        throw prepareError;
+      });
+      const commitInTx = vi.fn();
+      const compensate = vi.fn();
+
+      await expect(
+        executeExternalIdempotent(
+          res as never,
+          HTTP_STATUS.HTTP_201_CREATED,
+          prepare,
+          commitInTx,
+          compensate,
+        ),
+      ).rejects.toThrow(prepareError);
+
+      expect(store.runInTransaction).not.toHaveBeenCalled();
+      expect(commitInTx).not.toHaveBeenCalled();
+      expect(compensate).not.toHaveBeenCalled();
+      expect(store.deleteById).toHaveBeenCalledWith('rec-ext-2');
+    });
+
+    it('calls compensate and deletes IN_PROGRESS record when commitInTx fails', async () => {
+      const res = createMockResponse({ orderId: 'order-1' });
+      (res.locals as Record<string, unknown>).idempotency = {
+        recordId: 'rec-ext-3',
+        store,
+        completedTtlMs: 86_400_000,
+      };
+
+      const preparedData = { orderCode: 98765 };
+      const dbError = new Error('unique constraint violation');
+      const prepare = vi.fn(async () => preparedData);
+      const commitInTx = vi.fn(async () => {
+        throw dbError;
+      });
+      const compensate = vi.fn(async () => undefined);
+
+      await expect(
+        executeExternalIdempotent(
+          res as never,
+          HTTP_STATUS.HTTP_201_CREATED,
+          prepare,
+          commitInTx,
+          compensate,
+        ),
+      ).rejects.toThrow(dbError);
+
+      expect(compensate).toHaveBeenCalledWith(preparedData, dbError);
+      expect(store.deleteById).toHaveBeenCalledWith('rec-ext-3');
+      expect(store.markCompleted).not.toHaveBeenCalled();
+    });
+
+    it('preserves original commitInTx error and deletes IN_PROGRESS even if compensate throws', async () => {
+      const res = createMockResponse({ orderId: 'order-1' });
+      (res.locals as Record<string, unknown>).idempotency = {
+        recordId: 'rec-ext-4',
+        store,
+        completedTtlMs: 86_400_000,
+      };
+
+      const dbError = new Error('DB commit failed');
+      const prepare = vi.fn(async () => ({ orderCode: 55555 }));
+      const commitInTx = vi.fn(async () => {
+        throw dbError;
+      });
+      const compensate = vi.fn(async () => {
+        throw new Error('compensate failed');
+      });
+
+      await expect(
+        executeExternalIdempotent(
+          res as never,
+          HTTP_STATUS.HTTP_201_CREATED,
+          prepare,
+          commitInTx,
+          compensate,
+        ),
+      ).rejects.toThrow(dbError);
+
+      expect(compensate).toHaveBeenCalledTimes(1);
+      expect(store.deleteById).toHaveBeenCalledWith('rec-ext-4');
+    });
+
+    it('runs prepare and commitInTx directly when idempotency context is absent', async () => {
+      const res = createMockResponse({ orderId: 'order-1' });
+      const prepare = vi.fn(async () => ({ orderCode: 11111 }));
+      const commitInTx = vi.fn(async (prepared: { orderCode: number }, tx?: DbExecutor) => {
+        expect(tx).toBeUndefined();
+        return { ok: true, orderCode: prepared.orderCode };
+      });
+      const compensate = vi.fn();
+
+      const result = await executeExternalIdempotent(
+        res as never,
+        HTTP_STATUS.HTTP_201_CREATED,
+        prepare,
+        commitInTx,
+        compensate,
+      );
+
+      expect(result).toEqual({ ok: true, orderCode: 11111 });
+      expect(compensate).not.toHaveBeenCalled();
+    });
+
+    it('invokes best-effort compensate when idempotency context is absent and commitInTx fails', async () => {
+      const res = createMockResponse({ orderId: 'order-1' });
+      const preparedData = { orderCode: 22222 };
+      const dbError = new Error('tx failure');
+      const prepare = vi.fn(async () => preparedData);
+      const commitInTx = vi.fn(async () => {
+        throw dbError;
+      });
+      const compensate = vi.fn(async () => undefined);
+
+      await expect(
+        executeExternalIdempotent(
+          res as never,
+          HTTP_STATUS.HTTP_201_CREATED,
+          prepare,
+          commitInTx,
+          compensate,
+        ),
+      ).rejects.toThrow(dbError);
+
+      expect(compensate).toHaveBeenCalledWith(preparedData, dbError);
     });
   });
 });
