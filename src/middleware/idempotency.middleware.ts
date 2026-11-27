@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, lte, sql } from 'drizzle-orm';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
 import { db } from '../config/db.js';
@@ -12,7 +12,8 @@ import { createHttpError } from '../shared/errors/http-error.js';
 
 const IDEMPOTENCY_HEADER = 'idempotency-key';
 export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
-const DEFAULT_TTL_MS = 86_400_000; // 24 hours
+const DEFAULT_IN_PROGRESS_LEASE_MS = 60_000; // 60 seconds
+const DEFAULT_COMPLETED_TTL_MS = 86_400_000; // 24 hours
 
 export type DbExecutor =
   | typeof db
@@ -33,6 +34,7 @@ export interface IdempotencyStore {
     id: string,
     responseStatus: number,
     responseBody: Record<string, unknown>,
+    expiresAt: Date,
     executor?: DbExecutor,
   ): Promise<void>;
   deleteById(id: string): Promise<void>;
@@ -41,17 +43,21 @@ export interface IdempotencyStore {
 
 export interface IdempotencyExecutionContext {
   recordId: string;
+  completedTtlMs: number;
   store: IdempotencyStore;
 }
 
 export interface IdempotencyMiddlewareOptions {
   ttlMs?: number;
+  inProgressLeaseMs?: number;
   store?: IdempotencyStore;
 }
 
 const drizzleIdempotencyStore: IdempotencyStore = {
   async tryAcquire(input: AcquireIdempotencyInput): Promise<IdempotencyKeyRecord | null> {
-    const [inserted] = await db
+    // Atomically insert a new IN_PROGRESS row or take over an expired row in a single statement,
+    // avoiding delete-then-insert races and stale in-memory reads.
+    const [acquired] = await db
       .insert(idempotencyKeys)
       .values({
         userId: input.userId,
@@ -61,12 +67,21 @@ const drizzleIdempotencyStore: IdempotencyStore = {
         status: 'IN_PROGRESS',
         expiresAt: input.expiresAt,
       })
-      .onConflictDoNothing({
+      .onConflictDoUpdate({
         target: [idempotencyKeys.userId, idempotencyKeys.endpoint, idempotencyKeys.key],
+        set: {
+          requestHash: input.requestHash,
+          status: 'IN_PROGRESS',
+          responseStatus: null,
+          responseBody: null,
+          expiresAt: input.expiresAt,
+          updatedAt: sql`NOW()`,
+        },
+        setWhere: lte(idempotencyKeys.expiresAt, sql`NOW()`),
       })
       .returning();
 
-    return inserted ?? null;
+    return acquired ?? null;
   },
 
   async findByKey(
@@ -93,6 +108,7 @@ const drizzleIdempotencyStore: IdempotencyStore = {
     id: string,
     responseStatus: number,
     responseBody: Record<string, unknown>,
+    expiresAt: Date,
     executor: DbExecutor = db,
   ): Promise<void> {
     await executor
@@ -101,6 +117,7 @@ const drizzleIdempotencyStore: IdempotencyStore = {
         status: 'COMPLETED',
         responseStatus,
         responseBody,
+        expiresAt,
       })
       .where(eq(idempotencyKeys.id, id));
   },
@@ -117,6 +134,10 @@ const drizzleIdempotencyStore: IdempotencyStore = {
 function canonicalizeValue(value: unknown): unknown {
   if (value === null || typeof value !== 'object') {
     return value;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
   }
 
   if (Array.isArray(value)) {
@@ -186,7 +207,8 @@ export async function executeIdempotent<T>(
           ? (result as Record<string, unknown>)
           : { data: result };
 
-      await ctx.store.markCompleted(ctx.recordId, statusCode, responseBody, tx);
+      const completedExpiresAt = new Date(Date.now() + ctx.completedTtlMs);
+      await ctx.store.markCompleted(ctx.recordId, statusCode, responseBody, completedExpiresAt, tx);
       return result;
     });
   } catch (error) {
@@ -199,7 +221,8 @@ export function requireIdempotencyKey(
   endpoint: string,
   options: IdempotencyMiddlewareOptions = {},
 ): RequestHandler {
-  const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+  const completedTtlMs = options.ttlMs ?? DEFAULT_COMPLETED_TTL_MS;
+  const inProgressLeaseMs = options.inProgressLeaseMs ?? DEFAULT_IN_PROGRESS_LEASE_MS;
   const store = options.store ?? drizzleIdempotencyStore;
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -213,64 +236,56 @@ export function requireIdempotencyKey(
       const key = extractIdempotencyKey(req);
       const payload = res.locals.validated?.body ?? req.body;
       const requestHash = computeRequestHash(payload);
-      const acquireInput: AcquireIdempotencyInput = {
+
+      const acquired = await store.tryAcquire({
         userId,
         endpoint,
         key,
         requestHash,
-        expiresAt: new Date(Date.now() + ttlMs),
-      };
-
-      let acquired = await store.tryAcquire(acquireInput);
+        expiresAt: new Date(Date.now() + inProgressLeaseMs),
+      });
 
       if (!acquired) {
         const existing = await store.findByKey(userId, endpoint, key);
-        if (existing && existing.expiresAt.getTime() <= Date.now()) {
-          await store.deleteById(existing.id);
-          acquired = await store.tryAcquire(acquireInput);
-        }
 
-        if (!acquired) {
-          // The conflicting IN_PROGRESS record may have been deleted (e.g. on transaction rollback)
-          // between tryAcquire() and findByKey(), so treat a missing record as a transient 409.
-          if (!existing) {
-            next(
-              createHttpError(
-                HTTP_STATUS.HTTP_409_CONFLICT,
-                'A request with this Idempotency-Key is currently in progress',
-              ),
-            );
-            return;
-          }
-
-          if (existing.requestHash !== requestHash) {
-            next(
-              createHttpError(
-                HTTP_STATUS.HTTP_422_UNPROCESSABLE_ENTITY,
-                'Idempotency-Key cannot be reused with a different request payload',
-              ),
-            );
-            return;
-          }
-
-          if (existing.status === 'IN_PROGRESS') {
-            next(
-              createHttpError(
-                HTTP_STATUS.HTTP_409_CONFLICT,
-                'A request with this Idempotency-Key is currently in progress',
-              ),
-            );
-            return;
-          }
-
-          res
-            .status(existing.responseStatus ?? HTTP_STATUS.HTTP_200_OK)
-            .json(existing.responseBody ?? {});
+        // The active record may have been rolled back/deleted between tryAcquire() and findByKey().
+        if (!existing) {
+          next(
+            createHttpError(
+              HTTP_STATUS.HTTP_409_CONFLICT,
+              'A request with this Idempotency-Key is currently in progress',
+            ),
+          );
           return;
         }
+
+        if (existing.requestHash !== requestHash) {
+          next(
+            createHttpError(
+              HTTP_STATUS.HTTP_422_UNPROCESSABLE_ENTITY,
+              'Idempotency-Key cannot be reused with a different request payload',
+            ),
+          );
+          return;
+        }
+
+        if (existing.status === 'IN_PROGRESS') {
+          next(
+            createHttpError(
+              HTTP_STATUS.HTTP_409_CONFLICT,
+              'A request with this Idempotency-Key is currently in progress',
+            ),
+          );
+          return;
+        }
+
+        res
+          .status(existing.responseStatus ?? HTTP_STATUS.HTTP_200_OK)
+          .json(existing.responseBody ?? {});
+        return;
       }
 
-      res.locals.idempotency = { recordId: acquired.id, store };
+      res.locals.idempotency = { recordId: acquired.id, completedTtlMs, store };
       next();
     } catch (error) {
       next(error);

@@ -95,6 +95,13 @@ describe('idempotency.middleware', () => {
 
       expect(hashA).not.toBe(hashB);
     });
+
+    it('produces different hashes for payloads with different Date timestamps', () => {
+      const hashA = computeRequestHash({ scheduledAt: new Date('2026-11-27T00:00:00.000Z') });
+      const hashB = computeRequestHash({ scheduledAt: new Date('2026-11-27T01:00:00.000Z') });
+
+      expect(hashA).not.toBe(hashB);
+    });
   });
 
   describe('requireIdempotencyKey & executeIdempotent', () => {
@@ -197,6 +204,7 @@ describe('idempotency.middleware', () => {
         acquired.id,
         HTTP_STATUS.HTTP_201_CREATED,
         responsePayload,
+        expect.any(Date),
         fakeTx,
       );
 
@@ -204,6 +212,85 @@ describe('idempotency.middleware', () => {
       await expect(execution).resolves.toEqual(responsePayload);
       expect(settled).toBe(true);
       expect(store.deleteById).not.toHaveBeenCalled();
+    });
+
+    it('uses short IN_PROGRESS lease on acquire and extends expiresAt to 24h on markCompleted', async () => {
+      const acquired = buildRecord();
+      store.tryAcquire = vi.fn().mockResolvedValue(acquired);
+
+      const middleware = requireIdempotencyKey(ENDPOINT, { store });
+      const req = createMockRequest({
+        userId: USER_ID,
+        headers: { 'idempotency-key': KEY },
+      });
+      const res = createMockResponse({ amount: 50000, description: 'Order #1001' });
+      const next = vi.fn();
+
+      const beforeAcquire = Date.now();
+      await middleware(req, res as never, next);
+
+      const acquireInput = (store.tryAcquire as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+        expiresAt: Date;
+      };
+      const leaseMs = acquireInput.expiresAt.getTime() - beforeAcquire;
+      expect(leaseMs).toBeGreaterThanOrEqual(55_000);
+      expect(leaseMs).toBeLessThanOrEqual(65_000);
+
+      const beforeComplete = Date.now();
+      await executeIdempotent(res as never, HTTP_STATUS.HTTP_201_CREATED, async () => ({
+        id: 'order-1',
+      }));
+
+      const completedExpiresAt = (store.markCompleted as ReturnType<typeof vi.fn>).mock
+        .calls[0]?.[3] as Date;
+      const completedTtlMs = completedExpiresAt.getTime() - beforeComplete;
+      expect(completedTtlMs).toBeGreaterThanOrEqual(86_390_000);
+      expect(completedTtlMs).toBeLessThanOrEqual(86_410_000);
+    });
+
+    it('does not cache 4xx HttpError thrown by operation', async () => {
+      const acquired = buildRecord();
+      store.tryAcquire = vi.fn().mockResolvedValue(acquired);
+      const middleware = requireIdempotencyKey(ENDPOINT, { store });
+      const req = createMockRequest({
+        userId: USER_ID,
+        headers: { 'idempotency-key': KEY },
+      });
+      const res = createMockResponse();
+      await middleware(req, res as never, vi.fn());
+
+      await expect(
+        executeIdempotent(res as never, HTTP_STATUS.HTTP_201_CREATED, async () => {
+          throw Object.assign(new Error('Rate limited'), {
+            statusCode: HTTP_STATUS.HTTP_429_TOO_MANY_REQUESTS,
+          });
+        }),
+      ).rejects.toThrow('Rate limited');
+
+      expect(store.markCompleted).not.toHaveBeenCalled();
+      expect(store.deleteById).toHaveBeenCalledWith(acquired.id);
+    });
+
+    it('marks COMPLETED for 204 No Content operations via executeIdempotent', async () => {
+      const acquired = buildRecord();
+      store.tryAcquire = vi.fn().mockResolvedValue(acquired);
+      const middleware = requireIdempotencyKey(ENDPOINT, { store });
+      const req = createMockRequest({
+        userId: USER_ID,
+        headers: { 'idempotency-key': KEY },
+      });
+      const res = createMockResponse();
+      await middleware(req, res as never, vi.fn());
+
+      await executeIdempotent(res as never, HTTP_STATUS.HTTP_204_NO_CONTENT, async () => null);
+
+      expect(store.markCompleted).toHaveBeenCalledWith(
+        acquired.id,
+        HTTP_STATUS.HTTP_204_NO_CONTENT,
+        { data: null },
+        expect.any(Date),
+        fakeTx,
+      );
     });
 
     it('deletes IN_PROGRESS record and rethrows when operation fails inside transaction', async () => {
@@ -342,15 +429,9 @@ describe('idempotency.middleware', () => {
       );
     });
 
-    it('replaces expired record and allows processing to proceed', async () => {
-      const expired = buildRecord({
-        id: 'expired-id',
-        status: 'COMPLETED',
-        expiresAt: new Date(Date.now() - 1_000),
-      });
+    it('relies on atomic tryAcquire for expired keys without calling deleteById', async () => {
       const fresh = buildRecord({ id: 'fresh-id' });
-      store.tryAcquire = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(fresh);
-      store.findByKey = vi.fn().mockResolvedValue(expired);
+      store.tryAcquire = vi.fn().mockResolvedValueOnce(fresh);
 
       const middleware = requireIdempotencyKey(ENDPOINT, { store });
       const req = createMockRequest({
@@ -362,8 +443,9 @@ describe('idempotency.middleware', () => {
 
       await middleware(req, res as never, next);
 
-      expect(store.deleteById).toHaveBeenCalledWith('expired-id');
-      expect(store.tryAcquire).toHaveBeenCalledTimes(2);
+      expect(store.deleteById).not.toHaveBeenCalled();
+      expect(store.findByKey).not.toHaveBeenCalled();
+      expect(store.tryAcquire).toHaveBeenCalledTimes(1);
       expect(next).toHaveBeenCalledWith();
     });
   });

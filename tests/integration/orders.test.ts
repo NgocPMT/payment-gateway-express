@@ -254,6 +254,36 @@ describe('Orders API Integration', () => {
     expect(afterList.pagination.total).toBe(countBefore + 1);
   });
 
+  it('atomically takes over an expired Idempotency-Key and creates a fresh order', async () => {
+    const expiredKey = randomUUID();
+    await db.insert(idempotencyKeys).values({
+      userId: userAId,
+      endpoint: 'POST /api/v1/orders',
+      key: expiredKey,
+      requestHash: '0'.repeat(64),
+      status: 'COMPLETED',
+      responseStatus: HTTP_STATUS.HTTP_201_CREATED,
+      responseBody: { id: '018f6e72-0000-7000-8000-000000000001', amount: 10000 },
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+
+    const response = await fetch(`${baseUrl}/api/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${userAToken}`,
+        'idempotency-key': expiredKey,
+      },
+      body: JSON.stringify({ amount: 55000, description: 'Takeover expired key' }),
+    });
+
+    expect(response.status).toBe(HTTP_STATUS.HTTP_201_CREATED);
+    const created = (await response.json()) as OrderDTO;
+    expect(created.amount).toBe(55000);
+    expect(created.description).toBe('Takeover expired key');
+    expect(created.id).not.toBe('018f6e72-0000-7000-8000-000000000001');
+  });
+
   it('does not create duplicate order when client disconnects after order insert commits', async () => {
     const beforeListRes = await fetch(`${baseUrl}/api/v1/orders?page=1&limit=100`, {
       headers: { authorization: `Bearer ${userAToken}` },

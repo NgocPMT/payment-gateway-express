@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { check, integer, jsonb, pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
+import { check, index, integer, jsonb, pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { v7 as uuidv7 } from 'uuid';
 
 import { users } from './user.model.js';
@@ -43,6 +43,7 @@ export const idempotencyKeys = pgTable(
       )})`,
     ),
     uniqueIndex('idempotency_keys_user_endpoint_key_idx').on(table.userId, table.endpoint, table.key),
+    index('idempotency_keys_expires_at_idx').on(table.expiresAt),
   ],
 );
 
