@@ -231,6 +231,8 @@ export function requireIdempotencyKey(
         }
 
         if (!acquired) {
+          // The conflicting IN_PROGRESS record may have been deleted (e.g. on 5xx/disconnect)
+          // between tryAcquire() and findByKey(), so treat a missing record as a transient 409.
           if (!existing) {
             next(
               createHttpError(
