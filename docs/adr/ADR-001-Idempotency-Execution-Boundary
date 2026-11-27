@@ -1,0 +1,72 @@
+# Idempotency Execution Boundary
+
+> [!NOTE]
+> **Status**: Accepted
+>
+> **Updated**: 2026-11-27
+
+## Summary
+
+Write endpoints must not create duplicate records when clients retry after network drops or send concurrent identical requests. Running idempotency checks purely in HTTP middleware leaves the domain write and idempotency completion in separate DB transactions, causing duplicate writes on early disconnects and retry races after responses flush. This ADR chooses binding idempotency completion to the same DB transaction as the domain write for internal DB operations.
+
+## Drivers
+
+- Prevent duplicate records when a client disconnects mid-request or retries immediately.
+- Prevent false conflict errors when a retry arrives before the idempotency record finishes updating.
+- Keep the design framework-agnostic so it survives framework or ORM migrations.
+- Avoid holding DB transactions open during slow external API calls.
+
+## Options
+
+### Option 1: HTTP Middleware Only
+
+Middleware handles idempotency around the route handler:
+
+1. Validate key and payload hash, then insert an `IN_PROGRESS` lock.
+2. Run the handler, which commits its own DB transaction.
+3. On response finish, asynchronously mark the key `COMPLETED` and cache the response body.
+4. On early socket close or error, delete the `IN_PROGRESS` lock.
+
+### Option 2: Same-Transaction Completion
+
+Middleware acquires the lock, while completion shares the domain DB transaction:
+
+1. Boundary layer validates key and payload hash, replays completed responses, rejects conflicting in-flight requests, and inserts a short-lived `IN_PROGRESS` lock.
+2. Application layer runs the domain write and marks the key `COMPLETED` inside **one DB transaction**.
+3. Send the HTTP response only after that transaction commits.
+4. On failure or rollback, domain state stays unchanged and the `IN_PROGRESS` lock is deleted (or expires).
+5. Endpoints calling external APIs do not wrap network calls inside the DB transaction; they use a multi-step state machine instead.
+
+## Options Analysis
+
+### Option 1 Assessment: HTTP Middleware Only
+
+- **Pro**: Drop-in at routing layer; handlers and services need no changes.
+- **Con**: Domain write and idempotency update run in separate transactions. Crash or client disconnect after domain commit deletes or stalls the lock, causing duplicate records on retry.
+- **Con**: Updating the key after sending the response races with fast retries, returning false conflicts.
+- **Con**: Hooking response serialization misses non-JSON responses (e.g., `204`) and can cache transient `4xx` errors (e.g., `429`, `409`).
+
+### Option 2 Assessment: Same-Transaction Completion
+
+- **Pro**: Domain write and idempotency completion commit or roll back together.
+- **Pro**: Response goes out after commit, so immediate retries always replay the saved response.
+- **Pro**: Application explicitly controls which outcomes are cached.
+- **Con**: Services must accept a transaction handle from the caller.
+- **Other**: Only fits pure DB writes; external payment API calls must stay outside DB transactions.
+
+## Recommendation
+
+Use **Option 2: Same-Transaction Completion** for pure DB write endpoints.
+
+It eliminates duplicate writes on disconnects and post-response retry races without tying the pattern to a specific framework or ORM.
+
+### Consequences
+
+- **Pro**: Safe retries under concurrent requests, fast sequential retries, and early client disconnects.
+- **Con**: Repositories must accept an optional transaction handle.
+- **Other**: Endpoints calling external payment providers need a separate ADR using a multi-step state machine or outbox pattern.
+
+### Confirmation
+
+- Integration tests: verify sequential retry replays the same record, concurrent requests create only one record, payload mismatch fails, and early client disconnect after DB insert does not cause duplicates on retry.
+- Code review: reject post-response hooks for idempotency persistence and reject external HTTP calls inside DB transactions.
