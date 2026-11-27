@@ -245,11 +245,34 @@ describe('idempotency.middleware', () => {
       expect(res.json).toHaveBeenCalledWith(storedBody);
     });
 
-    it('rejects with 422 when key is reused with a different payload', async () => {
+    it('rejects with 422 when COMPLETED key is reused with a different payload', async () => {
       store.tryAcquire = vi.fn().mockResolvedValue(null);
       store.findByKey = vi.fn().mockResolvedValue(
         buildRecord({
           status: 'COMPLETED',
+          requestHash: computeRequestHash({ amount: 99999, description: 'Different' }),
+        }),
+      );
+      const middleware = requireIdempotencyKey(ENDPOINT, { store });
+      const req = createMockRequest({
+        userId: USER_ID,
+        headers: { 'idempotency-key': KEY },
+      });
+      const res = createMockResponse({ amount: 50000, description: 'Order #1001' });
+      const next = vi.fn();
+
+      await middleware(req, res as never, next);
+
+      expect(next).toHaveBeenCalledWith(
+        expect.objectContaining({ statusCode: HTTP_STATUS.HTTP_422_UNPROCESSABLE_ENTITY }),
+      );
+    });
+
+    it('rejects with 422 when IN_PROGRESS key is reused with a different payload', async () => {
+      store.tryAcquire = vi.fn().mockResolvedValue(null);
+      store.findByKey = vi.fn().mockResolvedValue(
+        buildRecord({
+          status: 'IN_PROGRESS',
           requestHash: computeRequestHash({ amount: 99999, description: 'Different' }),
         }),
       );

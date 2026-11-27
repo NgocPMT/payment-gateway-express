@@ -231,7 +231,7 @@ export function requireIdempotencyKey(
         }
 
         if (!acquired) {
-          if (!existing || existing.status === 'IN_PROGRESS') {
+          if (!existing) {
             next(
               createHttpError(
                 HTTP_STATUS.HTTP_409_CONFLICT,
@@ -246,6 +246,16 @@ export function requireIdempotencyKey(
               createHttpError(
                 HTTP_STATUS.HTTP_422_UNPROCESSABLE_ENTITY,
                 'Idempotency-Key cannot be reused with a different request payload',
+              ),
+            );
+            return;
+          }
+
+          if (existing.status === 'IN_PROGRESS') {
+            next(
+              createHttpError(
+                HTTP_STATUS.HTTP_409_CONFLICT,
+                'A request with this Idempotency-Key is currently in progress',
               ),
             );
             return;
