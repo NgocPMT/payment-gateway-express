@@ -4,7 +4,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IdempotencyKeyRecord } from '../../../src/models/idempotency-key.model.js';
 import {
   computeRequestHash,
+  executeIdempotent,
   requireIdempotencyKey,
+  type DbExecutor,
   type IdempotencyStore,
 } from '../../../src/middleware/idempotency.middleware.js';
 import { HTTP_STATUS } from '../../../src/shared/constants/http-status.js';
@@ -66,6 +68,7 @@ function createMockResponse(validatedBody?: unknown) {
 
 describe('idempotency.middleware', () => {
   let store: IdempotencyStore;
+  const fakeTx = {} as DbExecutor;
 
   beforeEach(() => {
     store = {
@@ -73,6 +76,7 @@ describe('idempotency.middleware', () => {
       findByKey: vi.fn(),
       markCompleted: vi.fn().mockResolvedValue(undefined),
       deleteById: vi.fn().mockResolvedValue(undefined),
+      runInTransaction: vi.fn().mockImplementation(async <T>(fn: (tx: DbExecutor) => Promise<T>) => fn(fakeTx)),
     };
   });
 
@@ -93,7 +97,7 @@ describe('idempotency.middleware', () => {
     });
   });
 
-  describe('requireIdempotencyKey', () => {
+  describe('requireIdempotencyKey & executeIdempotent', () => {
     it('rejects with 400 when Idempotency-Key header is missing or blank', async () => {
       const middleware = requireIdempotencyKey(ENDPOINT, { store });
       const nextMissing = vi.fn();
@@ -152,9 +156,18 @@ describe('idempotency.middleware', () => {
       );
     });
 
-    it('calls next and marks record COMPLETED when handler responds with 201 JSON', async () => {
+    it('awaits markCompleted inside transaction before executeIdempotent resolves', async () => {
       const acquired = buildRecord();
       store.tryAcquire = vi.fn().mockResolvedValue(acquired);
+
+      let resolveMarkCompleted: (() => void) | undefined;
+      store.markCompleted = vi.fn().mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveMarkCompleted = resolve;
+          }),
+      );
+
       const middleware = requireIdempotencyKey(ENDPOINT, { store });
       const req = createMockRequest({
         userId: USER_ID,
@@ -164,22 +177,36 @@ describe('idempotency.middleware', () => {
       const next = vi.fn();
 
       await middleware(req, res as never, next);
-
       expect(next).toHaveBeenCalledWith();
-      const responsePayload = { id: 'order-1', amount: 50000 };
-      res.status(HTTP_STATUS.HTTP_201_CREATED).json(responsePayload);
-      res.emit('finish');
-      await Promise.resolve();
 
+      const responsePayload = { id: 'order-1', amount: 50000 };
+      let settled = false;
+      const execution = executeIdempotent(
+        res as never,
+        HTTP_STATUS.HTTP_201_CREATED,
+        async () => responsePayload,
+      ).then((result) => {
+        settled = true;
+        return result;
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(settled).toBe(false);
       expect(store.markCompleted).toHaveBeenCalledWith(
         acquired.id,
         HTTP_STATUS.HTTP_201_CREATED,
         responsePayload,
+        fakeTx,
       );
+
+      resolveMarkCompleted?.();
+      await expect(execution).resolves.toEqual(responsePayload);
+      expect(settled).toBe(true);
       expect(store.deleteById).not.toHaveBeenCalled();
     });
 
-    it('deletes IN_PROGRESS record when handler responds with 5xx error', async () => {
+    it('deletes IN_PROGRESS record and rethrows when operation fails inside transaction', async () => {
       const acquired = buildRecord();
       store.tryAcquire = vi.fn().mockResolvedValue(acquired);
       const middleware = requireIdempotencyKey(ENDPOINT, { store });
@@ -192,15 +219,17 @@ describe('idempotency.middleware', () => {
 
       await middleware(req, res as never, next);
 
-      res.status(HTTP_STATUS.HTTP_500_INTERNAL_SERVER_ERROR).json({ error: 'Boom' });
-      res.emit('finish');
-      await Promise.resolve();
+      await expect(
+        executeIdempotent(res as never, HTTP_STATUS.HTTP_201_CREATED, async () => {
+          throw new Error('DB insert failed');
+        }),
+      ).rejects.toThrow('DB insert failed');
 
       expect(store.deleteById).toHaveBeenCalledWith(acquired.id);
       expect(store.markCompleted).not.toHaveBeenCalled();
     });
 
-    it('deletes IN_PROGRESS record if connection closes before finishing', async () => {
+    it('does not delete IN_PROGRESS record when client socket closes mid-flight', async () => {
       const acquired = buildRecord();
       store.tryAcquire = vi.fn().mockResolvedValue(acquired);
       const middleware = requireIdempotencyKey(ENDPOINT, { store });
@@ -217,7 +246,7 @@ describe('idempotency.middleware', () => {
       res.emit('close');
       await Promise.resolve();
 
-      expect(store.deleteById).toHaveBeenCalledWith(acquired.id);
+      expect(store.deleteById).not.toHaveBeenCalled();
     });
 
     it('replays stored response when key is COMPLETED and payload matches', async () => {

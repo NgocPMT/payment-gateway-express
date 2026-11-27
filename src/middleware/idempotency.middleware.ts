@@ -14,6 +14,10 @@ const IDEMPOTENCY_HEADER = 'idempotency-key';
 export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 const DEFAULT_TTL_MS = 86_400_000; // 24 hours
 
+export type DbExecutor =
+  | typeof db
+  | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 export interface AcquireIdempotencyInput {
   userId: string;
   endpoint: string;
@@ -29,8 +33,15 @@ export interface IdempotencyStore {
     id: string,
     responseStatus: number,
     responseBody: Record<string, unknown>,
+    executor?: DbExecutor,
   ): Promise<void>;
   deleteById(id: string): Promise<void>;
+  runInTransaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T>;
+}
+
+export interface IdempotencyExecutionContext {
+  recordId: string;
+  store: IdempotencyStore;
 }
 
 export interface IdempotencyMiddlewareOptions {
@@ -82,8 +93,9 @@ const drizzleIdempotencyStore: IdempotencyStore = {
     id: string,
     responseStatus: number,
     responseBody: Record<string, unknown>,
+    executor: DbExecutor = db,
   ): Promise<void> {
-    await db
+    await executor
       .update(idempotencyKeys)
       .set({
         status: 'COMPLETED',
@@ -95,6 +107,10 @@ const drizzleIdempotencyStore: IdempotencyStore = {
 
   async deleteById(id: string): Promise<void> {
     await db.delete(idempotencyKeys).where(eq(idempotencyKeys.id, id));
+  },
+
+  async runInTransaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T> {
+    return db.transaction(fn);
   },
 };
 
@@ -147,52 +163,36 @@ function extractIdempotencyKey(req: Request): string {
   return trimmed;
 }
 
-function attachResponsePersistenceHooks(
+/**
+ * Runs an idempotent mutation and marks the idempotency record COMPLETED inside
+ * the same database transaction, ensuring both commit atomically before the HTTP
+ * response is sent. Cleans up the IN_PROGRESS lock if the transaction fails.
+ */
+export async function executeIdempotent<T>(
   res: Response,
-  recordId: string,
-  store: IdempotencyStore,
-): void {
-  let responseCaptured = false;
-  let capturedBody: Record<string, unknown> = {};
-  let finalized = false;
+  statusCode: number,
+  operation: (tx?: DbExecutor) => Promise<T>,
+): Promise<T> {
+  const ctx = res.locals.idempotency;
+  if (!ctx) {
+    return operation();
+  }
 
-  const originalJson = res.json.bind(res);
-  res.json = ((body: unknown): Response => {
-    responseCaptured = true;
-    capturedBody =
-      body !== null && typeof body === 'object' && !Array.isArray(body)
-        ? (body as Record<string, unknown>)
-        : { data: body };
-    return originalJson(body);
-  }) as Response['json'];
+  try {
+    return await ctx.store.runInTransaction(async (tx) => {
+      const result = await operation(tx);
+      const responseBody =
+        result !== null && typeof result === 'object' && !Array.isArray(result)
+          ? (result as Record<string, unknown>)
+          : { data: result };
 
-  const cleanupInProgress = (): void => {
-    if (finalized) {
-      return;
-    }
-    finalized = true;
-    void store.deleteById(recordId);
-  };
-
-  res.on('finish', () => {
-    if (finalized) {
-      return;
-    }
-    finalized = true;
-
-    if (res.statusCode < HTTP_STATUS.HTTP_500_INTERNAL_SERVER_ERROR && responseCaptured) {
-      void store.markCompleted(recordId, res.statusCode, capturedBody);
-      return;
-    }
-
-    void store.deleteById(recordId);
-  });
-
-  res.on('close', () => {
-    if (!res.writableFinished) {
-      cleanupInProgress();
-    }
-  });
+      await ctx.store.markCompleted(ctx.recordId, statusCode, responseBody, tx);
+      return result;
+    });
+  } catch (error) {
+    await ctx.store.deleteById(ctx.recordId);
+    throw error;
+  }
 }
 
 export function requireIdempotencyKey(
@@ -231,7 +231,7 @@ export function requireIdempotencyKey(
         }
 
         if (!acquired) {
-          // The conflicting IN_PROGRESS record may have been deleted (e.g. on 5xx/disconnect)
+          // The conflicting IN_PROGRESS record may have been deleted (e.g. on transaction rollback)
           // between tryAcquire() and findByKey(), so treat a missing record as a transient 409.
           if (!existing) {
             next(
@@ -270,7 +270,7 @@ export function requireIdempotencyKey(
         }
       }
 
-      attachResponsePersistenceHooks(res, acquired.id, store);
+      res.locals.idempotency = { recordId: acquired.id, store };
       next();
     } catch (error) {
       next(error);

@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
+import http from 'node:http';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { inArray } from 'drizzle-orm';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { app } from '../../src/app.js';
 import { db, disconnectDatabase } from '../../src/config/db.js';
 import { accounts, idempotencyKeys, orders, users } from '../../src/models/index.js';
+import { ordersRepository } from '../../src/modules/orders/orders.repository.js';
 import type { OrderDTO, PaginatedOrdersResponse } from '../../src/modules/orders/orders.schemas.js';
 import { HTTP_STATUS } from '../../src/shared/constants/http-status.js';
 
@@ -244,6 +246,72 @@ describe('Orders API Integration', () => {
 
     expect(createdCount).toBeGreaterThanOrEqual(1);
     expect(createdCount + conflictCount).toBe(concurrentRequests);
+
+    const afterListRes = await fetch(`${baseUrl}/api/v1/orders?page=1&limit=100`, {
+      headers: { authorization: `Bearer ${userAToken}` },
+    });
+    const afterList = (await afterListRes.json()) as PaginatedOrdersResponse;
+    expect(afterList.pagination.total).toBe(countBefore + 1);
+  });
+
+  it('does not create duplicate order when client disconnects after order insert commits', async () => {
+    const beforeListRes = await fetch(`${baseUrl}/api/v1/orders?page=1&limit=100`, {
+      headers: { authorization: `Bearer ${userAToken}` },
+    });
+    const beforeList = (await beforeListRes.json()) as PaginatedOrdersResponse;
+    const countBefore = beforeList.pagination.total;
+
+    const idempotencyKey = randomUUID();
+    const payload = { amount: 65000, description: 'Disconnect mid-flight' };
+    const parsedUrl = new URL(`${baseUrl}/api/v1/orders`);
+
+    let clientReq: http.ClientRequest | undefined;
+    const originalCreateOrder = ordersRepository.createOrder.bind(ordersRepository);
+    const createOrderSpy = vi
+      .spyOn(ordersRepository, 'createOrder')
+      .mockImplementationOnce(async (data, executor) => {
+        const created = await originalCreateOrder(data, executor);
+        // Simulate client dropping TCP connection right after order insert, before HTTP response flushes
+        clientReq?.destroy();
+        return created;
+      });
+
+    await new Promise<void>((resolve) => {
+      clientReq = http.request(
+        {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port,
+          path: parsedUrl.pathname,
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${userAToken}`,
+            'idempotency-key': idempotencyKey,
+          },
+        },
+        () => resolve(),
+      );
+      clientReq.on('error', () => resolve());
+      clientReq.on('close', () => resolve());
+      clientReq.write(JSON.stringify(payload));
+      clientReq.end();
+    });
+
+    createOrderSpy.mockRestore();
+
+    // Give server a brief moment to finish committing the transaction
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const retry = await fetch(`${baseUrl}/api/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${userAToken}`,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    });
+    expect(retry.status).toBe(HTTP_STATUS.HTTP_201_CREATED);
 
     const afterListRes = await fetch(`${baseUrl}/api/v1/orders?page=1&limit=100`, {
       headers: { authorization: `Bearer ${userAToken}` },

@@ -6,6 +6,7 @@ import { ORDER_ERROR_MESSAGES } from './orders.constants.js';
 import {
   ordersRepository,
   type FindOrdersByUserOptions,
+  type OrderDbExecutor,
   type OrdersRepository,
 } from './orders.repository.js';
 import type {
@@ -30,12 +31,19 @@ export class OrdersService {
     };
   }
 
-  async createOrder(userId: string, input: CreateOrderRequest): Promise<OrderDTO> {
-    const order = await this.repository.createOrder({
+  async createOrder(
+    userId: string,
+    input: CreateOrderRequest,
+    executor?: OrderDbExecutor,
+  ): Promise<OrderDTO> {
+    const orderData = {
       userId,
       amount: input.amount,
       description: input.description,
-    });
+    };
+    const order = executor
+      ? await this.repository.createOrder(orderData, executor)
+      : await this.repository.createOrder(orderData);
     return this.mapOrderDto(order);
   }
 

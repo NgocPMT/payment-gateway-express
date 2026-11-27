@@ -1,5 +1,6 @@
 import type { Request, RequestHandler } from 'express';
 
+import { executeIdempotent } from '../../middleware/idempotency.middleware.js';
 import { HTTP_STATUS } from '../../shared/constants/http-status.js';
 import { createHttpError } from '../../shared/errors/http-error.js';
 import type {
@@ -23,7 +24,14 @@ export class OrdersController {
     try {
       const userId = requireAuthenticatedUserId(req);
       const input = res.locals.validated?.body as CreateOrderRequest;
-      const result = await this.service.createOrder(userId, input);
+      const result = await executeIdempotent(
+        res,
+        HTTP_STATUS.HTTP_201_CREATED,
+        (tx) =>
+          tx
+            ? this.service.createOrder(userId, input, tx)
+            : this.service.createOrder(userId, input),
+      );
       res.status(HTTP_STATUS.HTTP_201_CREATED).json(result);
     } catch (error) {
       next(error);
