@@ -66,6 +66,48 @@ export class OrdersRepository {
     return result ?? null;
   }
 
+  async findByIdForUpdate(
+    id: string,
+    executor: OrderDbExecutor,
+  ): Promise<OrderRecord | null> {
+    const [order] = await executor
+      .select()
+      .from(orders)
+      .where(eq(orders.id, id))
+      .for('update')
+      .limit(1);
+    return order ?? null;
+  }
+
+  async findByIdAndUserIdForUpdate(
+    id: string,
+    userId: string,
+    executor: OrderDbExecutor,
+  ): Promise<OrderRecord | null> {
+    const [order] = await executor
+      .select()
+      .from(orders)
+      .where(and(eq(orders.id, id), eq(orders.userId, userId)))
+      .for('update')
+      .limit(1);
+    return order ?? null;
+  }
+
+  async markPaidIfPending(
+    id: string,
+    executor: OrderDbExecutor = db,
+  ): Promise<OrderRecord | null> {
+    const [order] = await executor
+      .update(orders)
+      .set({
+        status: 'PAID',
+        updatedAt: new Date(),
+      })
+      .where(and(eq(orders.id, id), eq(orders.status, 'PENDING')))
+      .returning();
+    return order ?? null;
+  }
+
   async findManyByUserId(
     userId: string,
     options: FindOrdersByUserOptions,

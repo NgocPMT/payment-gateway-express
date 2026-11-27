@@ -77,6 +77,33 @@ export class OrdersService {
     const order = await this.getOwnedOrderEntity(userId, orderId);
     return this.mapOrderDto(order);
   }
+
+  async lockOrderById(orderId: string, executor: OrderDbExecutor): Promise<OrderRecord> {
+    const order = await this.repository.findByIdForUpdate(orderId, executor);
+    if (!order) {
+      throw createHttpError(HTTP_STATUS.HTTP_404_NOT_FOUND, ORDER_ERROR_MESSAGES.NOT_FOUND);
+    }
+    return order;
+  }
+
+  async lockOwnedOrder(
+    userId: string,
+    orderId: string,
+    executor: OrderDbExecutor,
+  ): Promise<OrderRecord> {
+    const order = await this.repository.findByIdAndUserIdForUpdate(orderId, userId, executor);
+    if (!order) {
+      throw createHttpError(HTTP_STATUS.HTTP_404_NOT_FOUND, ORDER_ERROR_MESSAGES.NOT_FOUND);
+    }
+    return order;
+  }
+
+  async markOrderPaidIfPending(
+    orderId: string,
+    executor: OrderDbExecutor,
+  ): Promise<OrderRecord | null> {
+    return this.repository.markPaidIfPending(orderId, executor);
+  }
 }
 
 export const ordersService = new OrdersService();
