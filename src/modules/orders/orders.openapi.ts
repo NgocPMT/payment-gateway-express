@@ -1,5 +1,7 @@
 import type { OpenAPIRegistry } from '@asteasolutions/zod-to-openapi';
+import { z } from 'zod';
 
+import { IDEMPOTENCY_KEY_MAX_LENGTH } from '../../middleware/idempotency.middleware.js';
 import { HTTP_STATUS } from '../../shared/constants/http-status.js';
 import {
   createOrderSchema,
@@ -8,6 +10,13 @@ import {
   orderIdParamSchema,
   paginatedOrdersResponseSchema,
 } from './orders.schemas.js';
+
+const idempotencyHeaderSchema = z.object({
+  'Idempotency-Key': z.string().min(1).max(IDEMPOTENCY_KEY_MAX_LENGTH).openapi({
+    description: 'Unique key to guarantee idempotent order creation across retries',
+    example: '018f6e72-5555-7e28-9f20-b42e77b4a1b4',
+  }),
+});
 
 export function registerOrdersOpenApi(registry: OpenAPIRegistry): void {
   const registeredCreateOrderRequest = registry.register(
@@ -27,6 +36,7 @@ export function registerOrdersOpenApi(registry: OpenAPIRegistry): void {
     summary: 'Create a new order',
     security: [{ bearerAuth: [] }],
     request: {
+      headers: idempotencyHeaderSchema,
       body: {
         content: {
           'application/json': {
@@ -45,10 +55,16 @@ export function registerOrdersOpenApi(registry: OpenAPIRegistry): void {
         },
       },
       [HTTP_STATUS.HTTP_400_BAD_REQUEST]: {
-        description: 'Invalid order payload',
+        description: 'Invalid order payload or missing Idempotency-Key header',
       },
       [HTTP_STATUS.HTTP_401_UNAUTHORIZED]: {
         description: 'Authentication required',
+      },
+      [HTTP_STATUS.HTTP_409_CONFLICT]: {
+        description: 'A request with this Idempotency-Key is already in progress',
+      },
+      [HTTP_STATUS.HTTP_422_UNPROCESSABLE_ENTITY]: {
+        description: 'Idempotency-Key reused with a different request payload',
       },
     },
   });

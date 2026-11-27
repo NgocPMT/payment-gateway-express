@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { inArray } from 'drizzle-orm';
@@ -5,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { app } from '../../src/app.js';
 import { db, disconnectDatabase } from '../../src/config/db.js';
-import { accounts, orders, users } from '../../src/models/index.js';
+import { accounts, idempotencyKeys, orders, users } from '../../src/models/index.js';
 import type { OrderDTO, PaginatedOrdersResponse } from '../../src/modules/orders/orders.schemas.js';
 import { HTTP_STATUS } from '../../src/shared/constants/http-status.js';
 
@@ -32,8 +33,9 @@ describe('Orders API Integration', () => {
         password: 'Password123!',
       }),
     });
-    expect(response.status).toBe(HTTP_STATUS.HTTP_201_CREATED);
-    return (await response.json()) as AuthRegisterResponse;
+    const rawBody = await response.text();
+    expect(response.status, rawBody).toBe(HTTP_STATUS.HTTP_201_CREATED);
+    return JSON.parse(rawBody) as AuthRegisterResponse;
   }
 
   beforeAll(async () => {
@@ -57,6 +59,7 @@ describe('Orders API Integration', () => {
   afterAll(async () => {
     const testUserIds = [userAId, userBId].filter(Boolean);
     if (testUserIds.length > 0) {
+      await db.delete(idempotencyKeys).where(inArray(idempotencyKeys.userId, testUserIds));
       await db.delete(orders).where(inArray(orders.userId, testUserIds));
       await db.delete(accounts).where(inArray(accounts.userId, testUserIds));
       await db.delete(users).where(inArray(users.id, testUserIds));
@@ -84,6 +87,7 @@ describe('Orders API Integration', () => {
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${userAToken}`,
+        'idempotency-key': randomUUID(),
       },
       body: JSON.stringify({ amount: 500, description: 'Too small' }),
     });
@@ -94,10 +98,24 @@ describe('Orders API Integration', () => {
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${userAToken}`,
+        'idempotency-key': randomUUID(),
       },
       body: JSON.stringify({ amount: 2147483648, description: 'Overflow' }),
     });
     expect(tooLarge.status).toBe(HTTP_STATUS.HTTP_400_BAD_REQUEST);
+  });
+
+  it('rejects POST /api/v1/orders without Idempotency-Key header with 400', async () => {
+    const response = await fetch(`${baseUrl}/api/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${userAToken}`,
+      },
+      body: JSON.stringify({ amount: 25000, description: 'Missing key' }),
+    });
+
+    expect(response.status).toBe(HTTP_STATUS.HTTP_400_BAD_REQUEST);
   });
 
   it('creates, lists, and enforces ownership on GET /api/v1/orders/:id', async () => {
@@ -106,6 +124,7 @@ describe('Orders API Integration', () => {
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${userAToken}`,
+        'idempotency-key': randomUUID(),
       },
       body: JSON.stringify({ amount: 25000, description: '  Order A1  ' }),
     });
@@ -121,6 +140,7 @@ describe('Orders API Integration', () => {
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${userBToken}`,
+        'idempotency-key': randomUUID(),
       },
       body: JSON.stringify({ amount: 30000, description: 'Order B1' }),
     });
@@ -150,6 +170,86 @@ describe('Orders API Integration', () => {
       { headers: { authorization: `Bearer ${userAToken}` } },
     );
     expect(getMissing.status).toBe(HTTP_STATUS.HTTP_404_NOT_FOUND);
+  });
+
+  it('replays stored order on sequential retry and rejects payload mismatch with 422', async () => {
+    const idempotencyKey = randomUUID();
+    const payload = { amount: 42000, description: 'Retryable order' };
+
+    const first = await fetch(`${baseUrl}/api/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${userAToken}`,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    });
+    expect(first.status).toBe(HTTP_STATUS.HTTP_201_CREATED);
+    const firstOrder = (await first.json()) as OrderDTO;
+
+    const retry = await fetch(`${baseUrl}/api/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${userAToken}`,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    });
+    expect(retry.status).toBe(HTTP_STATUS.HTTP_201_CREATED);
+    const retryOrder = (await retry.json()) as OrderDTO;
+    expect(retryOrder).toEqual(firstOrder);
+
+    const mismatched = await fetch(`${baseUrl}/api/v1/orders`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${userAToken}`,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify({ amount: 99000, description: 'Different payload' }),
+    });
+    expect(mismatched.status).toBe(HTTP_STATUS.HTTP_422_UNPROCESSABLE_ENTITY);
+  });
+
+  it('prevents duplicate orders under concurrent requests with the same Idempotency-Key', async () => {
+    const beforeListRes = await fetch(`${baseUrl}/api/v1/orders?page=1&limit=100`, {
+      headers: { authorization: `Bearer ${userAToken}` },
+    });
+    const beforeList = (await beforeListRes.json()) as PaginatedOrdersResponse;
+    const countBefore = beforeList.pagination.total;
+
+    const idempotencyKey = randomUUID();
+    const payload = { amount: 77000, description: 'Concurrent order' };
+    const concurrentRequests = 5;
+
+    const responses = await Promise.all(
+      Array.from({ length: concurrentRequests }, () =>
+        fetch(`${baseUrl}/api/v1/orders`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${userAToken}`,
+            'idempotency-key': idempotencyKey,
+          },
+          body: JSON.stringify(payload),
+        }),
+      ),
+    );
+
+    const statuses = responses.map((res) => res.status);
+    const createdCount = statuses.filter((s) => s === HTTP_STATUS.HTTP_201_CREATED).length;
+    const conflictCount = statuses.filter((s) => s === HTTP_STATUS.HTTP_409_CONFLICT).length;
+
+    expect(createdCount).toBeGreaterThanOrEqual(1);
+    expect(createdCount + conflictCount).toBe(concurrentRequests);
+
+    const afterListRes = await fetch(`${baseUrl}/api/v1/orders?page=1&limit=100`, {
+      headers: { authorization: `Bearer ${userAToken}` },
+    });
+    const afterList = (await afterListRes.json()) as PaginatedOrdersResponse;
+    expect(afterList.pagination.total).toBe(countBefore + 1);
   });
 
   it('exposes orders endpoints in /openapi.json', async () => {

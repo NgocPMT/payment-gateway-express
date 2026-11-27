@@ -11,7 +11,7 @@ import { HTTP_STATUS } from '../shared/constants/http-status.js';
 import { createHttpError } from '../shared/errors/http-error.js';
 
 const IDEMPOTENCY_HEADER = 'idempotency-key';
-const MAX_KEY_LENGTH = 128;
+export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 const DEFAULT_TTL_MS = 86_400_000; // 24 hours
 
 export interface AcquireIdempotencyInput {
@@ -137,10 +137,10 @@ function extractIdempotencyKey(req: Request): string {
     );
   }
 
-  if (trimmed.length > MAX_KEY_LENGTH) {
+  if (trimmed.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
     throw createHttpError(
       HTTP_STATUS.HTTP_400_BAD_REQUEST,
-      `Idempotency-Key header cannot exceed ${MAX_KEY_LENGTH} characters`,
+      `Idempotency-Key header cannot exceed ${IDEMPOTENCY_KEY_MAX_LENGTH} characters`,
     );
   }
 
